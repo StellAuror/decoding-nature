@@ -1,0 +1,260 @@
+Convert MP3 files into WAV (mono 16kb) for better performance
+```{r}
+# Load the required package
+pacman::p_load("av")
+
+# Ensure the output directory exists
+if (!dir.exists("audioWAV")) {
+  dir.create("audioWAV")
+}
+
+# Function to convert audio files to mono and 16 kHz
+lapply(list.files("audio", full.names = TRUE), function(inputpath) {
+  # Define the output path
+  outputpath <- file.path("audioWAV", paste0(tools::file_path_sans_ext(basename(inputpath)), ".wav"))
+  
+  # Print the input and output paths for debugging
+  message("Converting: ", inputpath)
+  message("Saving to: ", outputpath)
+  
+  # Convert to mono and 16 kHz
+  av_audio_convert(
+    audio = inputpath,
+    output = outputpath,
+    channels = 1,
+    sample_rate = 16000
+  )
+  
+  return(outputpath)
+})
+
+```
+
+Eventually examine the WAV files metadata
+
+```{r}
+# pacman::p_load("tuneR")
+# readWave(wav_paths[1])
+```
+
+Transcribe the WAV files
+```{r}
+pacman::p_load("reticulate")
+# reticulate::install_python
+# reticulate::py_install("whisper", envname = "r-reticulate")
+# reticulate::py_install("numpy==1.24.3", envname = "r-reticulate")
+# reticulate::py_install("ffmpeg-python")
+# reticulate::py_config()
+
+
+# Direct path to .wav's
+wav_paths <- paste0("audioWAV/", list.files("audioWAV")) |> 
+  normalizePath( winslash = "\\", mustWork = TRUE)
+file_names <- tools::file_path_sans_ext((basename(wav_paths)))
+
+
+# Import and load model
+whisper <- import("whisper")
+model <- whisper$load_model("medium")  
+
+# Transcribe and save
+  if (!dir.exists("transcript-data")) {
+    dir.create("transcript-data")
+  }
+
+lapply(1:length(file_names), function(i) {
+  model$transcribe(wav_paths[i], language = "pl") -> result
+  cat(result$text, file = paste0("transcript-data/", file_names[i]))
+})
+```
+
+
+```{r}
+files_path <- list.files("transcript-data/", full.names = TRUE)
+files_size <- file.info(files_path)$size
+
+
+files_text <- lapply(seq_along(files_path), function(x) {
+  readChar(files_path[x], nchars = files_size[x], useBytes = TRUE)
+}) |> unlist()
+
+```
+
+
+```{r}
+pacman::p_load(
+  tm, tidytext,
+  Rtsne, ggplot2
+)
+
+# Stwórz corpus
+corpus <- Corpus(VectorSource(files_text))
+corpus <- tm_map(corpus, content_transformer(tolower))
+corpus <- tm_map(corpus, removePunctuation)
+corpus <- tm_map(corpus, removeWords, stopwords("en"))
+corpus <- tm_map(corpus, stripWhitespace)
+
+# TF-IDF
+dtm <- DocumentTermMatrix(corpus)
+tfidf <- as.matrix(weightTfIdf(dtm))
+
+# Redukcja wymiarów (t-SNE)
+tsne <- Rtsne(tfidf, dims = 2, perplexity = 1, verbose = TRUE)
+
+# Wizualizacja
+data.frame(
+   x = tsne$Y[,1],
+   y = tsne$Y[,2],
+  label = paste0("Tekst ", files_path)
+) |>
+  ggplot(aes(x, y, label = label)) +
+  geom_point() +
+  geom_text(vjust = 1.5) +
+  theme_minimal()
+
+```
+
+
+```{r}
+pacman::p_load(
+  tm, tidytext,
+  Rtsne, igraph, visNetwork
+)
+
+# Stwórz corpus
+corpus <- Corpus(VectorSource(files_text))
+corpus <- tm_map(corpus, content_transformer(tolower))
+corpus <- tm_map(corpus, removePunctuation)
+corpus <- tm_map(corpus, removeWords, stopwords("en"))
+corpus <- tm_map(corpus, stripWhitespace)
+
+# TF-IDF
+dtm <- DocumentTermMatrix(corpus)
+tfidf <- as.matrix(weightTfIdf(dtm))
+
+# Obliczenie macierzy podobieństwa (kosinusowa miara podobieństwa)
+similarity_matrix <- tfidf %*% t(tfidf)
+norms <- sqrt(rowSums(tfidf^2))
+cosine_similarity <- similarity_matrix / (norms %o% norms)
+
+# Renederowanie prawdodpobieństw
+df_similarity <-
+  as.data.frame(as.table(cosine_similarity))
+df_similarity |> dplyr::filter(Freq < .5) |>
+  pull(Freq) |> hist()
+
+# Przekształcenie macierzy podobieństwa na format krawędzi
+edges <- as.data.frame(as.table(cosine_similarity)) |>
+  dplyr::filter(Docs != `Docs.1`, Freq > 0.05) |> # Filtrowanie niskich podobieństw
+  dplyr::rename(from = Docs, to = `Docs.1`, weight = Freq)
+
+# Tworzenie węzłów
+nodes <- data.frame(
+  id = unique(c(edges$from, edges$to)),
+  label = unique(c(edges$from, edges$to))
+)
+
+# Wizualizacja za pomocą visNetwork
+visNetwork(nodes, edges) %>%
+  visEdges(arrows = "to") %>%
+  visOptions(highlightNearest = TRUE, nodesIdSelection = TRUE) %>%
+  visLayout(randomSeed = 123) # Ustalony seed dla powtarzalności
+```
+
+
+```{r}
+pacman::p_load(
+  shiny, visNetwork, dplyr, tm, tidytext, markdown, pacman
+)
+
+# Ładowanie danych z plików
+files_path <- list.files("transcript-data/", full.names = TRUE)
+files_size <- file.info(files_path)$size
+
+files_text <- lapply(seq_along(files_path), function(x) {
+  readChar(files_path[x], nchars = files_size[x], useBytes = TRUE)
+}) |> unlist()
+
+# Przygotowanie korpusu
+corpus <- Corpus(VectorSource(files_text)) |>
+  tm_map(content_transformer(tolower)) |>
+  tm_map(removePunctuation) |>
+  tm_map(removeWords, stopwords("en")) |>
+  tm_map(stripWhitespace)
+
+# TF-IDF
+dtm <- DocumentTermMatrix(corpus)
+tfidf <- as.matrix(weightTfIdf(dtm))
+
+# Obliczenie macierzy podobieństwa (kosinusowa miara podobieństwa)
+similarity_matrix <- tfidf %*% t(tfidf)
+norms <- sqrt(rowSums(tfidf^2))
+cosine_similarity <- similarity_matrix / (norms %o% norms)
+
+# Przekształcenie macierzy podobieństwa na format krawędzi
+edges <- as.data.frame(as.table(cosine_similarity)) |>
+  dplyr::filter(Docs != `Docs.1`, Freq > 0.05) |> # Filtrowanie niskich podobieństw
+  dplyr::rename(from = Docs, to = `Docs.1`, weight = Freq)
+
+# Tworzenie węzłów
+nodes <- data.frame(
+  id = seq_along(files_path),
+  label = basename(files_path)
+)
+
+# Przypisanie tekstów do węzłów
+articles <- data.frame(
+  id = seq_along(files_text),
+  title = basename(files_path),
+  content = files_text
+)
+
+# Aplikacja Shiny
+ui <- fluidPage(
+  sidebarLayout(
+    sidebarPanel(
+      h3("Treść artykułu"),
+      uiOutput("article_title"),
+      uiOutput("article_content")
+    ),
+    mainPanel(
+      visNetworkOutput("network", height = "700px")
+    )
+  )
+)
+
+server <- function(input, output) {
+  # Renderowanie grafu
+  output$network <- renderVisNetwork({
+    visNetwork(nodes, edges) |>
+      visEdges(arrows = "to") |>
+      visOptions(highlightNearest = TRUE, nodesIdSelection = TRUE) |>
+      visLayout(randomSeed = 123)
+  })
+  
+  # Wyświetlanie treści artykułu w Markdown po zaznaczeniu węzła
+  observeEvent(input$network_selected, {
+    selected_node <- input$network_selected
+    if (!is.null(selected_node) && selected_node != "") {
+      article <- articles |>
+        filter(id == as.numeric(selected_node))
+      output$article_title <- renderUI({
+        h4(article$title)
+      })
+      output$article_content <- renderUI({
+        markdown::markdownToHTML(
+          text = article$content, 
+          fragment.only = TRUE
+        ) |> HTML()
+      })
+    } else {
+      output$article_title <- renderUI({ h4("Wybierz węzeł, aby zobaczyć szczegóły") })
+      output$article_content <- renderUI(NULL)
+    }
+  })
+}
+
+shinyApp(ui, server)
+
+
+```
